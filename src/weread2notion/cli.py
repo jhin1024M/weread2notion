@@ -1450,16 +1450,38 @@ def build_template_properties(source_name, raw_properties):
     return properties
 
 
-def upsert_template_page(source_name, lookup_property, lookup_value, raw_properties):
+def upsert_template_page(
+    source_name,
+    lookup_property,
+    lookup_value,
+    raw_properties,
+    icon_url=None,
+    cover_url=None,
+):
     existing = find_template_page(source_name, lookup_property, lookup_value)
     properties = build_template_properties(source_name, raw_properties)
     if existing:
         if properties:
-            client.pages.update(page_id=existing["id"], properties=properties)
+            update_kwargs = {"page_id": existing["id"], "properties": properties}
+            if icon_url:
+                update_kwargs["icon"] = get_icon(icon_url)
+            if cover_url:
+                update_kwargs["cover"] = get_icon(cover_url)
+            client.pages.update(**update_kwargs)
         return existing["id"], False
+    create_kwargs = {
+        "parent": {
+            "type": "data_source_id",
+            "data_source_id": template_source(source_name)["data_source_id"],
+        },
+        "properties": properties,
+    }
+    if icon_url:
+        create_kwargs["icon"] = get_icon(icon_url)
+    if cover_url:
+        create_kwargs["cover"] = get_icon(cover_url)
     response = client.pages.create(
-        parent={"type": "data_source_id", "data_source_id": template_source(source_name)["data_source_id"]},
-        properties=properties,
+        **create_kwargs,
     )
     page_id = response["id"]
     template_lookup_cache[(source_name, lookup_property, str(lookup_value))] = response
@@ -1808,6 +1830,8 @@ def sync_template_workspace(template_page_id):
             "BookId",
             book_id,
             template_book_properties(entry, sort, read_info, periods),
+            icon_url=entry.get("cover"),
+            cover_url=entry.get("cover"),
         )
         counts["books"] += 1
         should_sync_details = bool(

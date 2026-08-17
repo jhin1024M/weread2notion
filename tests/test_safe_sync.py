@@ -222,6 +222,32 @@ class SafeSyncTests(unittest.TestCase):
 
         self.assertNotIn("链接", properties)
 
+    def test_existing_template_book_page_receives_cover_and_icon(self):
+        self.configure_template_sources()
+        with patch(
+            "weread2notion.cli.find_template_page",
+            return_value={"id": "existing-book-page"},
+        ):
+            page_id, created = cli.upsert_template_page(
+                "书架",
+                "BookId",
+                "book-1",
+                {"书名": "测试书", "BookId": "book-1"},
+                icon_url="https://example.com/cover.jpg",
+                cover_url="https://example.com/cover.jpg",
+            )
+
+        self.assertEqual((page_id, created), ("existing-book-page", False))
+        self.client.pages.update.assert_called_once_with(
+            page_id="existing-book-page",
+            properties={
+                "书名": {"title": [{"type": "text", "text": {"content": "测试书"}}]},
+                "BookId": {"rich_text": [{"type": "text", "text": {"content": "book-1"}}]},
+            },
+            icon={"type": "external", "external": {"url": "https://example.com/cover.jpg"}},
+            cover={"type": "external", "external": {"url": "https://example.com/cover.jpg"}},
+        )
+
     @patch("weread2notion.cli.upsert_template_page")
     @patch("weread2notion.cli.get_or_create_template_page")
     def test_template_periods_use_chinese_calendar_titles(self, get_or_create, upsert):
