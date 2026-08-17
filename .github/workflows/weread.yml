@@ -5,6 +5,10 @@ on:
   schedule:
     - cron: "0 0 * * *"
 
+concurrency:
+  group: weread-sync
+  cancel-in-progress: false
+
 jobs:
   sync:
     name: Sync
@@ -20,4 +24,5 @@ jobs:
           notion-page: ${{ secrets.NOTION_PAGE }}
           notion-database-id: ${{ secrets.NOTION_DATABASE_ID }}
           notion-data-source-id: ${{ secrets.NOTION_DATA_SOURCE_ID }}
+          notion-report-page: ${{ secrets.NOTION_REPORT_PAGE }}
           notion-sync-mode: safe
