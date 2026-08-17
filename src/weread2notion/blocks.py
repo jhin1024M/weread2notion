@@ -79,12 +79,10 @@ def get_multi_select(names):
 
 
 def get_date(start):
-    return {
-        "date": {
-            "start": start,
-            "time_zone": "Asia/Shanghai",
-        }
-    }
+    date = {"start": start}
+    if "T" in str(start):
+        date["time_zone"] = "Asia/Shanghai"
+    return {"date": date}
 
 
 def get_icon(url):

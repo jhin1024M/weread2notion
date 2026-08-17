@@ -15,6 +15,7 @@ dependencies = [
   "notion-client",
   "python-dotenv",
   "retrying",
+  "tzdata",
 ]
 
 [project.scripts]
