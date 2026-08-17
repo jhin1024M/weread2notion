@@ -10,7 +10,7 @@ inputs:
     description: Notion integration token.
     required: true
   notion-page:
-    description: Notion database page URL or database ID.
+    description: Official WeRead template page URL or ID. A legacy database URL or ID is also supported.
     required: false
   notion-database-id:
     description: Notion database ID. Used when notion-page is not set.
