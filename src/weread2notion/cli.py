@@ -6,6 +6,7 @@ import time
 from notion_client import Client
 import requests
 from datetime import datetime
+from zoneinfo import ZoneInfo
 import hashlib
 from dotenv import load_dotenv
 from notion_client.errors import APIResponseError
@@ -44,6 +45,9 @@ SYNC_PAGE_TITLE = "微信读书同步内容"
 SYNC_MODE_SAFE = "safe"
 SYNC_MODE_REPLACE = "replace"
 SYNC_BLOCK_MARKER = "\u2063\u2064\u2062"
+SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
+READING_DASHBOARD_TITLE = "阅读看板"
+READING_DAILY_ROOT_TITLE = "阅读日报"
 NOTION_TOKEN_PATTERN = re.compile(r"^(secret|ntn)_[A-Za-z0-9_-]{20,}$")
 WEREAD_API_KEY_PATTERN = re.compile(r"^[A-Za-z0-9._~+/=-]{10,}$")
 NOTION_ID_PATTERN = re.compile(
@@ -101,6 +105,7 @@ def validate_secret_inputs():
     notion_page = clean_secret_value("NOTION_PAGE")
     notion_database_id = clean_secret_value("NOTION_DATABASE_ID")
     notion_data_source_id = clean_secret_value("NOTION_DATA_SOURCE_ID")
+    notion_report_page = clean_secret_value("NOTION_REPORT_PAGE")
 
     validate_regex(
         "WEREAD_API_KEY",
@@ -126,6 +131,8 @@ def validate_secret_inputs():
         )
     if notion_page and not NOTION_ID_IN_TEXT_PATTERN.search(notion_page):
         fail_config("NOTION_PAGE 格式不正确：请填写 Notion 页面链接、数据库链接或 ID")
+    if notion_report_page and not NOTION_ID_IN_TEXT_PATTERN.search(notion_report_page):
+        fail_config("NOTION_REPORT_PAGE 格式不正确：请填写 Notion 页面链接或 ID")
     if not (notion_data_source_id or notion_page or notion_database_id):
         fail_config(
             "缺少 NOTION_PAGE / NOTION_DATA_SOURCE_ID / NOTION_DATABASE_ID，"
@@ -134,6 +141,7 @@ def validate_secret_inputs():
     return {
         "weread_api_key": weread_api_key,
         "notion_token": notion_token,
+        "notion_report_page": notion_report_page,
     }
 
 
@@ -387,24 +395,57 @@ def get_chapter_info(bookId):
     return {item["chapterUid"]: item for item in chapters if "chapterUid" in item}
 
 
-def build_book_properties(bookName, bookId, sort, author, isbn, rating, categories):
+def build_book_properties(
+    bookName,
+    bookId,
+    sort,
+    author,
+    isbn,
+    rating,
+    categories,
+    shelf_metadata=None,
+):
     """Build the shared book properties used for create and update."""
+    book_link = (
+        shelf_metadata.get("link")
+        if shelf_metadata is not None
+        else f"https://weread.qq.com/web/reader/{calculate_book_str_id(bookId)}"
+    )
     raw_properties = {
         title_property_name: bookName,
         "BookId": bookId,
-        "ISBN": isbn,
-        "链接": f"https://weread.qq.com/web/reader/{calculate_book_str_id(bookId)}",
         "作者": author,
         "Sort": sort,
-        "评分": rating,
     }
+    if book_link:
+        raw_properties["链接"] = book_link
+    if isbn:
+        raw_properties["ISBN"] = isbn
+    if rating is not None:
+        raw_properties["评分"] = rating
     if categories is not None:
         raw_properties["分类"] = categories
-    read_info = (
-        get_read_info(bookId=bookId)
-        if has_any_property(("状态", "阅读时长", "阅读进度", "时间"))
-        else None
+    if shelf_metadata:
+        raw_properties.update(
+            {
+                "类型": shelf_metadata.get("kind"),
+                "置顶": shelf_metadata.get("is_top"),
+                "私密": shelf_metadata.get("is_secret"),
+            }
+        )
+        if shelf_metadata.get("read_update_time"):
+            raw_properties["最近阅读"] = shelf_metadata["read_update_time"]
+        if shelf_metadata.get("finished"):
+            raw_properties["状态"] = "读完"
+        elif shelf_metadata.get("read_update_time"):
+            raw_properties["状态"] = "在读"
+    read_info = None
+    should_load_read_info = not shelf_metadata or (
+        shelf_metadata.get("kind") == "电子书"
+        and (shelf_metadata.get("read_update_time") or shelf_metadata.get("finished"))
     )
+    if has_any_property(("状态", "阅读时长", "阅读进度", "时间")) and should_load_read_info:
+        read_info = get_read_info(bookId=bookId)
     if read_info is not None:
         marked_status = read_info.get("markedStatus", 0)
         reading_time = read_info.get("readingTime", 0)
@@ -436,12 +477,20 @@ def insert_to_notion(
     rating,
     categories,
     existing_page=None,
+    shelf_metadata=None,
 ):
     """Create a book page or update it in place."""
     if not cover or not cover.startswith("http"):
         cover = "https://www.notion.so/icons/book_gray.svg"
     properties = build_book_properties(
-        bookName, bookId, sort, author, isbn, rating, categories
+        bookName,
+        bookId,
+        sort,
+        author,
+        isbn,
+        rating,
+        categories,
+        shelf_metadata=shelf_metadata,
     )
     icon = get_icon(cover)
     if existing_page:
@@ -501,6 +550,268 @@ def get_notebooklist():
             hasMore = 0
     books.sort(key=lambda x: x.get("sort") or 0)
     return books
+
+
+@retry(stop_max_attempt_number=3, wait_fixed=5000)
+def get_shelf():
+    return weread.request("/shelf/sync")
+
+
+@retry(stop_max_attempt_number=3, wait_fixed=5000)
+def get_reading_stats(mode):
+    return weread.request("/readdata/detail", mode=mode)
+
+
+def timestamp_matches_date(value, target_date):
+    try:
+        return datetime.fromtimestamp(int(value), SHANGHAI_TZ).date() == target_date
+    except (TypeError, ValueError, OSError):
+        return False
+
+
+def format_duration(seconds):
+    seconds = int(to_number(seconds) or 0)
+    hours, remainder = divmod(seconds, 3600)
+    minutes = remainder // 60
+    if hours:
+        return f"{hours}小时{minutes}分钟"
+    return f"{minutes}分钟"
+
+
+def normalize_categories(value):
+    if not value:
+        return None
+    if isinstance(value, list):
+        return [
+            item.get("title") if isinstance(item, dict) else to_text(item)
+            for item in value
+            if (item.get("title") if isinstance(item, dict) else to_text(item))
+        ]
+    if isinstance(value, dict):
+        return [value.get("title")] if value.get("title") else None
+    return [to_text(value)]
+
+
+def get_shelf_entries(shelf):
+    entries = []
+    for book in shelf.get("books") or []:
+        book_id = book.get("bookId")
+        if not book_id:
+            continue
+        entries.append(
+            {
+                "book_id": str(book_id),
+                "title": book.get("title") or "未命名书籍",
+                "author": book.get("author") or "",
+                "cover": book.get("cover") or "",
+                "link": book.get("deepLink") or "",
+                "categories": normalize_categories(
+                    book.get("category") or book.get("categories")
+                ),
+                "kind": "电子书",
+                "finished": bool(book.get("finishReading")),
+                "read_update_time": book.get("readUpdateTime") or 0,
+                "is_top": bool(book.get("isTop")),
+                "is_secret": bool(book.get("secret")),
+            }
+        )
+    for album in shelf.get("albums") or []:
+        info = album.get("albumInfo") or {}
+        extra = album.get("albumInfoExtra") or {}
+        album_id = info.get("albumId")
+        if not album_id:
+            continue
+        entries.append(
+            {
+                "book_id": f"album:{album_id}",
+                "title": info.get("name") or "未命名有声书",
+                "author": info.get("authorName") or "",
+                "cover": info.get("cover") or "",
+                "link": "",
+                "categories": None,
+                "kind": "有声书",
+                "finished": bool(info.get("finish")),
+                "read_update_time": extra.get("lectureReadUpdateTime") or 0,
+                "is_top": bool(extra.get("isTop")),
+                "is_secret": bool(extra.get("secret")),
+            }
+        )
+    if shelf.get("mp"):
+        entries.append(
+            {
+                "book_id": "mp:articles",
+                "title": "文章收藏",
+                "author": "微信读书",
+                "cover": "",
+                "link": "",
+                "categories": None,
+                "kind": "文章收藏",
+                "finished": False,
+                "read_update_time": 0,
+                "is_top": False,
+                "is_secret": True,
+            }
+        )
+    return entries
+
+
+def get_daily_read_seconds(reading_stats, target_date):
+    for field in ("dailyReadTimes", "readTimes"):
+        for timestamp, seconds in (reading_stats.get(field) or {}).items():
+            if timestamp_matches_date(timestamp, target_date):
+                return int(to_number(seconds) or 0)
+    return 0
+
+
+def get_daily_active_entries(shelf_entries, target_date):
+    return [
+        entry
+        for entry in shelf_entries
+        if timestamp_matches_date(entry.get("read_update_time"), target_date)
+    ]
+
+
+def get_review_create_time(item):
+    return (item.get("review") or item).get("createTime")
+
+
+def get_daily_note_counts(notebooks, target_date):
+    highlights = 0
+    thoughts = 0
+    for item in notebooks:
+        if not timestamp_matches_date(item.get("sort"), target_date):
+            continue
+        book = item.get("book") or item
+        book_id = book.get("bookId")
+        if not book_id:
+            continue
+        for bookmark in get_bookmark_list(book_id):
+            if timestamp_matches_date(bookmark.get("createTime"), target_date):
+                highlights += 1
+        summary, reviews = get_review_list(book_id)
+        for review in summary + reviews:
+            if timestamp_matches_date(get_review_create_time(review), target_date):
+                thoughts += 1
+    return highlights, thoughts
+
+
+def find_child_page(parent_page_id, title):
+    for block in list_block_children(parent_page_id):
+        if block.get("type") == "child_page" and get_child_page_title(block) == title:
+            return block.get("id")
+    return None
+
+
+def get_or_create_child_page(parent_page_id, title):
+    existing_page = find_child_page(parent_page_id, title)
+    if existing_page:
+        return existing_page
+    response = client.pages.create(
+        parent={"page_id": parent_page_id},
+        properties={"title": get_title(title)},
+    )
+    return response["id"]
+
+
+def sync_managed_page_content(page_id, children):
+    sync_container_id = find_sync_container(page_id)
+    if not sync_container_id:
+        sync_container_id = create_sync_container(page_id)
+    clear_sync_container(sync_container_id)
+    return add_children(sync_container_id, children)
+
+
+def build_daily_report_children(
+    target_date, read_seconds, active_entries, highlights, thoughts
+):
+    children = [
+        get_heading(1, "今日概览", marker=SYNC_BLOCK_MARKER),
+        get_callout(f"阅读时长：{format_duration(read_seconds)}", marker=SYNC_BLOCK_MARKER),
+        get_callout(
+            f"活跃书籍：{len(active_entries)} 本", marker=SYNC_BLOCK_MARKER
+        ),
+        get_callout(f"新增划线：{highlights} 条", marker=SYNC_BLOCK_MARKER),
+        get_callout(f"新增想法：{thoughts} 条", marker=SYNC_BLOCK_MARKER),
+    ]
+    if active_entries:
+        children.append(get_heading(2, "今日活跃书籍", marker=SYNC_BLOCK_MARKER))
+        for entry in active_entries[:20]:
+            author = f" · {entry['author']}" if entry.get("author") else ""
+            children.append(
+                get_callout(
+                    f"{entry['title']}{author}", marker=SYNC_BLOCK_MARKER
+                )
+            )
+    return children
+
+
+def build_dashboard_children(shelf_entries, monthly_stats, annual_stats):
+    total_entries = len(shelf_entries)
+    books = len([entry for entry in shelf_entries if entry["kind"] == "电子书"])
+    albums = len([entry for entry in shelf_entries if entry["kind"] == "有声书"])
+    children = [
+        get_heading(1, "书架概览", marker=SYNC_BLOCK_MARKER),
+        get_callout(
+            f"书架共有 {total_entries} 个条目：{books} 本电子书，{albums} 个有声书",
+            marker=SYNC_BLOCK_MARKER,
+        ),
+        get_heading(1, "阅读统计", marker=SYNC_BLOCK_MARKER),
+        get_callout(
+            f"本月阅读：{format_duration(monthly_stats.get('totalReadTime'))} · "
+            f"{monthly_stats.get('readDays') or 0} 个阅读日",
+            marker=SYNC_BLOCK_MARKER,
+        ),
+        get_callout(
+            f"本年阅读：{format_duration(annual_stats.get('totalReadTime'))} · "
+            f"{annual_stats.get('readDays') or 0} 个阅读日",
+            marker=SYNC_BLOCK_MARKER,
+        ),
+    ]
+    top_books = monthly_stats.get("readLongest") or []
+    if top_books:
+        children.append(get_heading(2, "本月阅读最多", marker=SYNC_BLOCK_MARKER))
+        for item in top_books[:5]:
+            book = item.get("book") or item.get("albumInfo") or {}
+            title = book.get("title") or book.get("name") or "未命名内容"
+            children.append(
+                get_callout(
+                    f"{title} · {format_duration(item.get('readTime'))}",
+                    marker=SYNC_BLOCK_MARKER,
+                )
+            )
+    categories = annual_stats.get("preferCategory") or []
+    if categories:
+        children.append(get_heading(2, "阅读偏好", marker=SYNC_BLOCK_MARKER))
+        category_text = "、".join(
+            item.get("categoryTitle", "") for item in categories[:5] if item.get("categoryTitle")
+        )
+        if category_text:
+            children.append(get_callout(category_text, marker=SYNC_BLOCK_MARKER))
+    return children
+
+
+def sync_reading_reports(report_page_id, shelf_entries, notebooks):
+    today = datetime.now(SHANGHAI_TZ).date()
+    annual_stats = get_reading_stats("annually")
+    monthly_stats = get_reading_stats("monthly")
+    daily_root_id = get_or_create_child_page(report_page_id, READING_DAILY_ROOT_TITLE)
+    daily_page_id = get_or_create_child_page(daily_root_id, today.isoformat())
+    daily_read_seconds = get_daily_read_seconds(annual_stats, today)
+    active_entries = get_daily_active_entries(shelf_entries, today)
+    highlights, thoughts = get_daily_note_counts(notebooks, today)
+    sync_managed_page_content(
+        daily_page_id,
+        build_daily_report_children(
+            today, daily_read_seconds, active_entries, highlights, thoughts
+        ),
+    )
+    dashboard_page_id = get_or_create_child_page(report_page_id, READING_DASHBOARD_TITLE)
+    sync_managed_page_content(
+        dashboard_page_id,
+        build_dashboard_children(shelf_entries, monthly_stats, annual_stats),
+    )
+    print(f"已更新阅读日报：{today.isoformat()}")
+    print("已更新阅读看板")
 
 
 def get_sort():
@@ -710,6 +1021,15 @@ def extract_notion_id():
     fail_config("获取 Notion ID 失败，请检查 NOTION_PAGE / NOTION_DATA_SOURCE_ID")
 
 
+def extract_optional_notion_id(value, name):
+    if not value:
+        return None
+    match = NOTION_ID_IN_TEXT_PATTERN.search(value)
+    if match:
+        return match.group(0)
+    fail_config(f"获取 {name} 失败，请检查页面链接或 ID")
+
+
 def query_data_source(**body):
     return client.request(
         path=f"data_sources/{data_source_id}/query",
@@ -914,6 +1234,101 @@ def resolve_data_source_id(notion_id):
     return sources[0]["id"]
 
 
+def sync_book_content(book_page_id, book_id, sync_mode):
+    chapter = get_chapter_info(book_id)
+    bookmark_list = get_bookmark_list(book_id)
+    summary, reviews = get_review_list(book_id)
+    bookmark_list.extend(reviews)
+    bookmark_list = sorted(
+        bookmark_list,
+        key=lambda item: get_note_sort_key(item, chapter),
+    )
+    children, grandchild = get_children(chapter, summary, bookmark_list)
+    legacy_sync_page_id = None
+    if sync_mode == SYNC_MODE_SAFE:
+        legacy_sync_page_id = find_legacy_sync_page(book_page_id)
+        results = sync_managed_page_content(book_page_id, children)
+    else:
+        results = add_children(book_page_id, children)
+    if grandchild and results is not None:
+        add_grandchild(grandchild, results)
+    if legacy_sync_page_id and results is not None:
+        client.blocks.delete(block_id=legacy_sync_page_id)
+        print("已移除旧版微信读书同步内容子页面")
+
+
+def get_notebook_book_id(item):
+    return (item.get("book") or item).get("bookId")
+
+
+def sync_shelf_entries(shelf_entries, notebooks, latest_sort, sync_mode):
+    notebook_by_id = {
+        str(book_id): item
+        for item in notebooks
+        if (book_id := get_notebook_book_id(item))
+    }
+    synced_ids = set()
+    for index, entry in enumerate(shelf_entries, start=1):
+        book_id = entry["book_id"]
+        notebook = notebook_by_id.get(book_id)
+        sort = (notebook or {}).get("sort") or 0
+        existing_page = find_book_page(book_id)
+        should_sync_content = bool(
+            notebook and (sort > latest_sort or existing_page is None)
+        )
+        if sync_mode == SYNC_MODE_REPLACE and should_sync_content:
+            check(book_id)
+            existing_page = None
+        isbn, rating = "", None
+        if should_sync_content and has_any_property(("ISBN", "评分")):
+            isbn, rating = get_bookinfo(book_id)
+        print(f"正在同步书架 {entry['title']}，当前是第 {index}/{len(shelf_entries)} 本")
+        book_page_id = insert_to_notion(
+            entry["title"],
+            book_id,
+            entry["cover"],
+            sort,
+            entry["author"],
+            isbn,
+            rating,
+            entry["categories"],
+            existing_page=existing_page,
+            shelf_metadata=entry,
+        )
+        synced_ids.add(book_id)
+        if should_sync_content:
+            sync_book_content(book_page_id, book_id, sync_mode)
+
+    for notebook in notebooks:
+        book = notebook.get("book") or notebook
+        book_id = book.get("bookId")
+        if not book_id or str(book_id) in synced_ids:
+            continue
+        sort = notebook.get("sort") or 0
+        existing_page = find_book_page(book_id)
+        if sort <= latest_sort and existing_page is not None:
+            continue
+        if sync_mode == SYNC_MODE_REPLACE:
+            check(book_id)
+            existing_page = None
+        title = book.get("title") or "未命名书籍"
+        cover = (book.get("cover") or "").replace("/s_", "/t7_")
+        categories = normalize_categories(book.get("categories"))
+        isbn, rating = (get_bookinfo(book_id) if has_any_property(("ISBN", "评分")) else ("", None))
+        book_page_id = insert_to_notion(
+            title,
+            book_id,
+            cover,
+            sort,
+            book.get("author") or "",
+            isbn,
+            rating,
+            categories,
+            existing_page=existing_page,
+        )
+        sync_book_content(book_page_id, book_id, sync_mode)
+
+
 def sync():
     global client, data_source_id, weread
     secrets = validate_secret_inputs()
@@ -932,67 +1347,19 @@ def sync():
     print(f"Notion Sync Mode: {sync_mode}")
     load_data_source_schema()
     latest_sort = get_sort()
-    books = get_notebooklist()
-    if books != None:
-        for index, book in enumerate(books):
-            sort = book["sort"]
-            if sort <= latest_sort:
-                continue
-            book = book.get("book") or book
-            title = book.get("title") or ""
-            cover = (book.get("cover") or "").replace("/s_", "/t7_")
-            bookId = book.get("bookId")
-            author = book.get("author") or ""
-            if not bookId:
-                continue
-            categories = book.get("categories")
-            if categories != None:
-                categories = [x["title"] for x in categories]
-            print(f"正在同步 {title} ,一共{len(books)}本，当前是第{index+1}本。")
-            existing_page = find_book_page(bookId) if sync_mode == SYNC_MODE_SAFE else None
-            if sync_mode == SYNC_MODE_REPLACE:
-                check(bookId)
-            if has_any_property(("ISBN", "评分")):
-                isbn, rating = get_bookinfo(bookId)
-            else:
-                isbn, rating = "", None
-            book_page_id = insert_to_notion(
-                title,
-                bookId,
-                cover,
-                sort,
-                author,
-                isbn,
-                rating,
-                categories,
-                existing_page=existing_page,
-            )
-            chapter = get_chapter_info(bookId)
-            bookmark_list = get_bookmark_list(bookId)
-            summary, reviews = get_review_list(bookId)
-            bookmark_list.extend(reviews)
-            bookmark_list = sorted(
-                bookmark_list,
-                key=lambda x: get_note_sort_key(x, chapter),
-            )
-            children, grandchild = get_children(chapter, summary, bookmark_list)
-            legacy_sync_page_id = None
-            if sync_mode == SYNC_MODE_SAFE:
-                legacy_sync_page_id = find_legacy_sync_page(book_page_id)
-                sync_container_id = find_sync_container(book_page_id)
-                if not sync_container_id:
-                    sync_container_id = create_sync_container(book_page_id)
-                    print(f"已创建安全同步折叠区: {SYNC_PAGE_TITLE}")
-                clear_sync_container(sync_container_id)
-                content_page_id = sync_container_id
-            else:
-                content_page_id = book_page_id
-            results = add_children(content_page_id, children)
-            if len(grandchild) > 0 and results != None:
-                add_grandchild(grandchild, results)
-            if legacy_sync_page_id and results is not None:
-                client.blocks.delete(block_id=legacy_sync_page_id)
-                print("已移除旧版微信读书同步内容子页面")
+    notebooks = get_notebooklist()
+    shelf = get_shelf()
+    shelf_entries = get_shelf_entries(shelf)
+    print(f"已读取完整书架：{len(shelf_entries)} 个条目")
+    sync_shelf_entries(shelf_entries, notebooks, latest_sort, sync_mode)
+
+    report_page_id = extract_optional_notion_id(
+        secrets["notion_report_page"], "NOTION_REPORT_PAGE"
+    )
+    if report_page_id:
+        sync_reading_reports(report_page_id, shelf_entries, notebooks)
+    else:
+        print("未配置 NOTION_REPORT_PAGE，跳过阅读日报和阅读看板同步")
 
 
 def main(argv=None):
