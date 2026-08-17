@@ -1,4 +1,25 @@
-def get_heading(level, content):
+def get_rich_text_segments(content, marker=None):
+    segments = [
+        {
+            "type": "text",
+            "text": {
+                "content": content,
+            },
+        }
+    ]
+    if marker:
+        segments.append(
+            {
+                "type": "text",
+                "text": {
+                    "content": marker,
+                },
+            }
+        )
+    return segments
+
+
+def get_heading(level, content, marker=None):
     if level == 1:
         heading = "heading_1"
     elif level == 2:
@@ -8,14 +29,7 @@ def get_heading(level, content):
     return {
         "type": heading,
         heading: {
-            "rich_text": [
-                {
-                    "type": "text",
-                    "text": {
-                        "content": content,
-                    },
-                }
-            ],
+            "rich_text": get_rich_text_segments(content, marker),
             "color": "default",
             "is_toggleable": False,
         },
@@ -89,31 +103,19 @@ def get_number(number):
     return {"number": number}
 
 
-def get_quote(content):
+def get_quote(content, marker=None):
     return {
         "type": "quote",
         "quote": {
-            "rich_text": [
-                {
-                    "type": "text",
-                    "text": {"content": content},
-                }
-            ],
+            "rich_text": get_rich_text_segments(content, marker),
             "color": "default",
         },
     }
 
 
-def get_callout(content, icon=None):
+def get_callout(content, icon=None, marker=None):
     callout = {
-        "rich_text": [
-            {
-                "type": "text",
-                "text": {
-                    "content": content,
-                },
-            }
-        ],
+        "rich_text": get_rich_text_segments(content, marker),
     }
     if icon:
         callout["icon"] = {"type": "emoji", "emoji": icon}
