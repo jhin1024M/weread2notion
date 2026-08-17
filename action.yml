@@ -19,7 +19,7 @@ inputs:
     description: Notion data source ID. Preferred for Notion-Version 2026-03-11.
     required: false
   notion-sync-mode:
-    description: Sync mode: safe preserves book pages and user content; replace keeps legacy behavior.
+    description: "Sync mode: safe preserves book pages and user content; replace keeps legacy behavior."
     required: false
     default: safe
   python-version:
