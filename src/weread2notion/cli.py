@@ -21,6 +21,7 @@ from .blocks import (
     get_rich_text,
     get_select,
     get_status,
+    get_toggle,
     get_title,
     get_url,
 )
@@ -311,8 +312,18 @@ def get_child_page_title(block):
     return (block.get("child_page") or {}).get("title") or ""
 
 
-def find_sync_page(book_page_id):
-    """Find the managed child page used by safe sync mode."""
+def get_block_text(block):
+    block_type = block.get("type")
+    payload = block.get(block_type) or {}
+    rich_text = payload.get("rich_text") or []
+    return "".join(
+        item.get("plain_text") or (item.get("text") or {}).get("content", "")
+        for item in rich_text
+    )
+
+
+def find_legacy_sync_page(book_page_id):
+    """Find the child page created by the first safe-sync implementation."""
     for block in list_block_children(book_page_id):
         if (
             block.get("type") == "child_page"
@@ -322,18 +333,29 @@ def find_sync_page(book_page_id):
     return None
 
 
-def create_sync_page(book_page_id):
-    """Create the managed child page without touching user-authored blocks."""
-    response = client.pages.create(
-        parent={"page_id": book_page_id},
-        properties={"title": get_title(SYNC_PAGE_TITLE)},
+def find_sync_container(book_page_id):
+    """Find the inline toggle block managed by safe sync mode."""
+    for block in list_block_children(book_page_id):
+        if block.get("type") == "toggle" and get_block_text(block) == SYNC_PAGE_TITLE:
+            return block.get("id")
+    return None
+
+
+def create_sync_container(book_page_id):
+    """Create an inline toggle block without touching user-authored content."""
+    response = client.blocks.children.append(
+        block_id=book_page_id,
+        children=[get_toggle(SYNC_PAGE_TITLE)],
     )
-    return response["id"]
+    results = response.get("results") or []
+    if not results or not results[0].get("id"):
+        raise Exception("创建微信读书同步内容折叠区失败")
+    return results[0]["id"]
 
 
-def clear_sync_page(sync_page_id):
-    """Archive only blocks inside the managed sync page."""
-    for block in list_block_children(sync_page_id):
+def clear_sync_container(sync_container_id):
+    """Archive only blocks inside the managed inline toggle block."""
+    for block in list_block_children(sync_container_id):
         block_id = block.get("id")
         if not block_id:
             continue
@@ -942,18 +964,23 @@ def sync():
                 key=lambda x: get_note_sort_key(x, chapter),
             )
             children, grandchild = get_children(chapter, summary, bookmark_list)
+            legacy_sync_page_id = None
             if sync_mode == SYNC_MODE_SAFE:
-                sync_page_id = find_sync_page(book_page_id)
-                if not sync_page_id:
-                    sync_page_id = create_sync_page(book_page_id)
-                    print(f"已创建安全同步子页面: {SYNC_PAGE_TITLE}")
-                clear_sync_page(sync_page_id)
-                content_page_id = sync_page_id
+                legacy_sync_page_id = find_legacy_sync_page(book_page_id)
+                sync_container_id = find_sync_container(book_page_id)
+                if not sync_container_id:
+                    sync_container_id = create_sync_container(book_page_id)
+                    print(f"已创建安全同步折叠区: {SYNC_PAGE_TITLE}")
+                clear_sync_container(sync_container_id)
+                content_page_id = sync_container_id
             else:
                 content_page_id = book_page_id
             results = add_children(content_page_id, children)
             if len(grandchild) > 0 and results != None:
                 add_grandchild(grandchild, results)
+            if legacy_sync_page_id and results is not None:
+                client.blocks.delete(block_id=legacy_sync_page_id)
+                print("已移除旧版微信读书同步内容子页面")
 
 
 def main(argv=None):

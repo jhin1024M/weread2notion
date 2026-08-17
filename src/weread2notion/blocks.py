@@ -22,6 +22,23 @@ def get_heading(level, content):
     }
 
 
+def get_toggle(content):
+    return {
+        "type": "toggle",
+        "toggle": {
+            "rich_text": [
+                {
+                    "type": "text",
+                    "text": {
+                        "content": content,
+                    },
+                }
+            ],
+            "color": "default",
+        },
+    }
+
+
 def get_table_of_contents():
     """获取目录"""
     return {"type": "table_of_contents", "table_of_contents": {"color": "default"}}
