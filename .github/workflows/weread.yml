@@ -3,7 +3,8 @@ name: weread sync
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 0 * * *"
+    # 23:55 Asia/Shanghai (UTC+8)
+    - cron: "55 15 * * *"
 
 concurrency:
   group: weread-sync
