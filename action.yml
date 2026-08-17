@@ -18,6 +18,10 @@ inputs:
   notion-data-source-id:
     description: Notion data source ID. Preferred for Notion-Version 2026-03-11.
     required: false
+  notion-sync-mode:
+    description: Sync mode: safe preserves book pages and user content; replace keeps legacy behavior.
+    required: false
+    default: safe
   python-version:
     description: Python version used to run the sync.
     required: false
@@ -43,4 +47,5 @@ runs:
         NOTION_PAGE: ${{ inputs.notion-page }}
         NOTION_DATABASE_ID: ${{ inputs.notion-database-id }}
         NOTION_DATA_SOURCE_ID: ${{ inputs.notion-data-source-id }}
+        NOTION_SYNC_MODE: ${{ inputs.notion-sync-mode }}
       run: weread2notion sync

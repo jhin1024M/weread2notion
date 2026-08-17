@@ -39,6 +39,9 @@ WEREAD_SKILL_VERSION = "1.0.4"
 NOTION_VERSION = "2026-03-11"
 BOOKMARK_CALLOUT_ICON = "〰️"
 NOTE_CALLOUT_ICON = "✍️"
+SYNC_PAGE_TITLE = "微信读书同步内容"
+SYNC_MODE_SAFE = "safe"
+SYNC_MODE_REPLACE = "replace"
 NOTION_TOKEN_PATTERN = re.compile(r"^(secret|ntn)_[A-Za-z0-9_-]{20,}$")
 WEREAD_API_KEY_PATTERN = re.compile(r"^[A-Za-z0-9._~+/=-]{10,}$")
 NOTION_ID_PATTERN = re.compile(
@@ -278,6 +281,75 @@ def check(bookId):
             print(f"删除块时出错: {e}")
 
 
+def find_book_page(bookId):
+    """Find the existing Notion page for a WeRead book."""
+    filter = build_equals_filter("BookId", bookId)
+    response = query_data_source(filter=filter, page_size=1)
+    results = response.get("results") or []
+    return results[0] if results else None
+
+
+def list_block_children(block_id):
+    """List all direct children of a Notion block or page."""
+    results = []
+    cursor = None
+    while True:
+        body = {"block_id": block_id, "page_size": 100}
+        if cursor:
+            body["start_cursor"] = cursor
+        response = client.blocks.children.list(**body)
+        results.extend(response.get("results") or [])
+        if not response.get("has_more"):
+            return results
+        cursor = response.get("next_cursor")
+        if not cursor:
+            return results
+
+
+def get_child_page_title(block):
+    """Return a child page title regardless of Notion rich-text shape."""
+    return (block.get("child_page") or {}).get("title") or ""
+
+
+def find_sync_page(book_page_id):
+    """Find the managed child page used by safe sync mode."""
+    for block in list_block_children(book_page_id):
+        if (
+            block.get("type") == "child_page"
+            and get_child_page_title(block) == SYNC_PAGE_TITLE
+        ):
+            return block.get("id")
+    return None
+
+
+def create_sync_page(book_page_id):
+    """Create the managed child page without touching user-authored blocks."""
+    response = client.pages.create(
+        parent={"page_id": book_page_id},
+        properties={"title": get_title(SYNC_PAGE_TITLE)},
+    )
+    return response["id"]
+
+
+def clear_sync_page(sync_page_id):
+    """Archive only blocks inside the managed sync page."""
+    for block in list_block_children(sync_page_id):
+        block_id = block.get("id")
+        if not block_id:
+            continue
+        try:
+            client.blocks.delete(block_id=block_id)
+        except Exception as e:
+            print(f"清理同步内容时出错: {e}")
+
+
+def get_sync_mode():
+    mode = (os.getenv("NOTION_SYNC_MODE") or SYNC_MODE_SAFE).strip().lower()
+    if mode not in {SYNC_MODE_SAFE, SYNC_MODE_REPLACE}:
+        fail_config("NOTION_SYNC_MODE 只能是 safe 或 replace")
+    return mode
+
+
 @retry(stop_max_attempt_number=3, wait_fixed=5000)
 def get_chapter_info(bookId):
     """获取章节信息"""
@@ -286,11 +358,8 @@ def get_chapter_info(bookId):
     return {item["chapterUid"]: item for item in chapters if "chapterUid" in item}
 
 
-def insert_to_notion(bookName, bookId, cover, sort, author, isbn, rating, categories):
-    """插入到notion"""
-    if not cover or not cover.startswith("http"):
-        cover = "https://www.notion.so/icons/book_gray.svg"
-    parent = {"type": "data_source_id", "data_source_id": data_source_id}
+def build_book_properties(bookName, bookId, sort, author, isbn, rating, categories):
+    """Build the shared book properties used for create and update."""
     raw_properties = {
         title_property_name: bookName,
         "BookId": bookId,
@@ -300,40 +369,70 @@ def insert_to_notion(bookName, bookId, cover, sort, author, isbn, rating, catego
         "Sort": sort,
         "评分": rating,
     }
-    if categories != None:
+    if categories is not None:
         raw_properties["分类"] = categories
     read_info = (
         get_read_info(bookId=bookId)
         if has_any_property(("状态", "阅读时长", "阅读进度", "时间"))
         else None
     )
-    if read_info != None:
-        markedStatus = read_info.get("markedStatus", 0)
-        readingTime = read_info.get("readingTime", 0)
-        readingProgress = read_info.get("readingProgress", 0)
+    if read_info is not None:
+        marked_status = read_info.get("markedStatus", 0)
+        reading_time = read_info.get("readingTime", 0)
+        reading_progress = read_info.get("readingProgress", 0)
         format_time = ""
-        hour = readingTime // 3600
+        hour = reading_time // 3600
         if hour > 0:
             format_time += f"{hour}时"
-        minutes = readingTime % 3600 // 60
+        minutes = reading_time % 3600 // 60
         if minutes > 0:
             format_time += f"{minutes}分"
-        raw_properties["状态"] = "读完" if markedStatus == 4 else "在读"
+        raw_properties["状态"] = "读完" if marked_status == 4 else "在读"
         raw_properties["阅读时长"] = format_time
-        raw_properties["阅读进度"] = readingProgress
-        if "finishedDate" in read_info:
+        raw_properties["阅读进度"] = reading_progress
+        if read_info.get("finishedDate"):
             raw_properties["时间"] = datetime.utcfromtimestamp(
-                read_info.get("finishedDate")
-            ).strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
+                read_info["finishedDate"]
+            ).strftime("%Y-%m-%d %H:%M:%S")
+    return build_notion_properties(raw_properties)
 
-    properties = build_notion_properties(raw_properties)
+
+def insert_to_notion(
+    bookName,
+    bookId,
+    cover,
+    sort,
+    author,
+    isbn,
+    rating,
+    categories,
+    existing_page=None,
+):
+    """Create a book page or update it in place."""
+    if not cover or not cover.startswith("http"):
+        cover = "https://www.notion.so/icons/book_gray.svg"
+    properties = build_book_properties(
+        bookName, bookId, sort, author, isbn, rating, categories
+    )
     icon = get_icon(cover)
-    # notion api 限制100个block
-    response = client.pages.create(parent=parent, icon=icon,cover=icon, properties=properties)
-    id = response["id"]
-    return id
+    if existing_page:
+        page_id = existing_page["id"]
+        client.pages.update(
+            page_id=page_id,
+            icon=icon,
+            cover=icon,
+            properties=properties,
+        )
+        return page_id
+
+    parent = {"type": "data_source_id", "data_source_id": data_source_id}
+    response = client.pages.create(
+        parent=parent,
+        icon=icon,
+        cover=icon,
+        properties=properties,
+    )
+    return response["id"]
 
 
 def add_children(id, children):
@@ -784,6 +883,7 @@ def resolve_data_source_id(notion_id):
 def sync():
     global client, data_source_id, weread
     secrets = validate_secret_inputs()
+    sync_mode = get_sync_mode()
     notion_id = extract_notion_id()
     notion_token = secrets["notion_token"]
     weread = WeReadGatewayClient(secrets["weread_api_key"])
@@ -795,6 +895,7 @@ def sync():
     data_source_id = resolve_data_source_id(notion_id)
     print(f"Notion API Version: {NOTION_VERSION}")
     print(f"Notion Data Source ID: {data_source_id}")
+    print(f"Notion Sync Mode: {sync_mode}")
     load_data_source_schema()
     latest_sort = get_sort()
     books = get_notebooklist()
@@ -814,13 +915,23 @@ def sync():
             if categories != None:
                 categories = [x["title"] for x in categories]
             print(f"正在同步 {title} ,一共{len(books)}本，当前是第{index+1}本。")
-            check(bookId)
+            existing_page = find_book_page(bookId) if sync_mode == SYNC_MODE_SAFE else None
+            if sync_mode == SYNC_MODE_REPLACE:
+                check(bookId)
             if has_any_property(("ISBN", "评分")):
                 isbn, rating = get_bookinfo(bookId)
             else:
                 isbn, rating = "", None
-            id = insert_to_notion(
-                title, bookId, cover, sort, author, isbn, rating, categories
+            book_page_id = insert_to_notion(
+                title,
+                bookId,
+                cover,
+                sort,
+                author,
+                isbn,
+                rating,
+                categories,
+                existing_page=existing_page,
             )
             chapter = get_chapter_info(bookId)
             bookmark_list = get_bookmark_list(bookId)
@@ -831,7 +942,16 @@ def sync():
                 key=lambda x: get_note_sort_key(x, chapter),
             )
             children, grandchild = get_children(chapter, summary, bookmark_list)
-            results = add_children(id, children)
+            if sync_mode == SYNC_MODE_SAFE:
+                sync_page_id = find_sync_page(book_page_id)
+                if not sync_page_id:
+                    sync_page_id = create_sync_page(book_page_id)
+                    print(f"已创建安全同步子页面: {SYNC_PAGE_TITLE}")
+                clear_sync_page(sync_page_id)
+                content_page_id = sync_page_id
+            else:
+                content_page_id = book_page_id
+            results = add_children(content_page_id, children)
             if len(grandchild) > 0 and results != None:
                 add_grandchild(grandchild, results)
 
