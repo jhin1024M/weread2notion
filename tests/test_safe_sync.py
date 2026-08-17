@@ -36,17 +36,31 @@ class SafeSyncTests(unittest.TestCase):
 
         self.assertEqual(cli.find_sync_container("book-page"), "managed-content")
 
-    def test_clear_sync_container_only_archives_its_direct_children(self):
+    def test_clear_sync_container_preserves_user_authored_blocks(self):
         self.client.blocks.children.list.return_value = {
-            "results": [{"id": "block-1"}, {"id": "block-2"}],
+            "results": [
+                {
+                    "id": "manual-block",
+                    "type": "paragraph",
+                    "paragraph": {"rich_text": [{"plain_text": "我的补充"}]},
+                },
+                {
+                    "id": "generated-block",
+                    "type": "callout",
+                    "callout": {
+                        "rich_text": [
+                            {"plain_text": "微信读书划线"},
+                            {"plain_text": cli.SYNC_BLOCK_MARKER},
+                        ]
+                    },
+                },
+            ],
             "has_more": False,
         }
 
         cli.clear_sync_container("managed-content")
 
-        self.client.blocks.delete.assert_any_call(block_id="block-1")
-        self.client.blocks.delete.assert_any_call(block_id="block-2")
-        self.assertEqual(self.client.blocks.delete.call_count, 2)
+        self.client.blocks.delete.assert_called_once_with(block_id="generated-block")
 
     def test_create_sync_container_adds_inline_toggle(self):
         self.client.blocks.children.append.return_value = {
@@ -73,6 +87,16 @@ class SafeSyncTests(unittest.TestCase):
                 }
             ],
         )
+
+    def test_generated_children_include_an_invisible_sync_marker(self):
+        children, _ = cli.get_children(
+            chapter=None,
+            summary=[],
+            bookmark_list=[{"markText": "微信读书划线"}],
+        )
+
+        rich_text = children[0]["callout"]["rich_text"]
+        self.assertEqual(rich_text[-1]["text"]["content"], cli.SYNC_BLOCK_MARKER)
 
     @patch("weread2notion.cli.get_icon", return_value={"type": "external"})
     @patch("weread2notion.cli.build_book_properties", return_value={"BookId": {}})
