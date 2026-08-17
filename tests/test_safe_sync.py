@@ -240,6 +240,21 @@ class SafeSyncTests(unittest.TestCase):
             {"2026-08-17": {"timestamp": 1786939200, "seconds": 3661}},
         )
 
+    def test_date_with_explicit_offset_does_not_repeat_timezone(self):
+        self.assertEqual(
+            cli.get_date("2026-08-17T20:00:00+08:00"),
+            {"date": {"start": "2026-08-17T20:00:00+08:00"}},
+        )
+        self.assertEqual(
+            cli.get_date("2026-08-17T20:00:00"),
+            {
+                "date": {
+                    "start": "2026-08-17T20:00:00",
+                    "time_zone": "Asia/Shanghai",
+                }
+            },
+        )
+
     @patch("weread2notion.cli.load_template_source")
     @patch("weread2notion.cli.list_descendant_blocks")
     def test_template_discovery_requires_the_complete_layout(self, blocks, load_source):
