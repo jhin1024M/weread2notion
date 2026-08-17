@@ -1205,7 +1205,8 @@ def build_notion_property(name, value):
         number = to_number(value)
         return get_number(number) if number is not None else None
     if prop_type == "url":
-        return get_url(to_text(value))
+        url = to_text(value).strip()
+        return get_url(url) if url else None
     if prop_type in {"multi_select", "status", "select"}:
         return build_option_property(prop_type, value)
     if prop_type == "date":
@@ -1414,7 +1415,8 @@ def build_template_property(source_name, property_name, value):
         number = to_number(value)
         return get_number(number) if number is not None else None
     if prop_type == "url":
-        return get_url(to_text(value))
+        url = to_text(value).strip()
+        return get_url(url) if url else None
     if prop_type in {"select", "status"}:
         names = to_name_list(value)
         if not names:
