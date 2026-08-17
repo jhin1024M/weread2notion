@@ -1,5 +1,6 @@
 import os
 import unittest
+from datetime import datetime
 from unittest.mock import Mock, patch
 
 from weread2notion import cli
@@ -97,6 +98,44 @@ class SafeSyncTests(unittest.TestCase):
 
         rich_text = children[0]["callout"]["rich_text"]
         self.assertEqual(rich_text[-1]["text"]["content"], cli.SYNC_BLOCK_MARKER)
+
+    def test_shelf_entries_include_books_albums_and_article_collection(self):
+        entries = cli.get_shelf_entries(
+            {
+                "books": [
+                    {
+                        "bookId": "book-1",
+                        "title": "电子书",
+                        "author": "作者",
+                        "category": "文学",
+                    }
+                ],
+                "albums": [
+                    {
+                        "albumInfo": {
+                            "albumId": "album-1",
+                            "name": "有声书",
+                            "authorName": "演播者",
+                        },
+                        "albumInfoExtra": {},
+                    }
+                ],
+                "mp": {"title": "文章收藏"},
+            }
+        )
+
+        self.assertEqual([entry["book_id"] for entry in entries], ["book-1", "album:album-1", "mp:articles"])
+        self.assertEqual(entries[0]["categories"], ["文学"])
+
+    def test_daily_read_seconds_uses_shanghai_calendar_date(self):
+        timestamp = int(datetime(2026, 8, 17, 8, 0, tzinfo=cli.SHANGHAI_TZ).timestamp())
+
+        seconds = cli.get_daily_read_seconds(
+            {"dailyReadTimes": {str(timestamp): 3661}},
+            datetime(2026, 8, 17, tzinfo=cli.SHANGHAI_TZ).date(),
+        )
+
+        self.assertEqual(seconds, 3661)
 
     @patch("weread2notion.cli.get_icon", return_value={"type": "external"})
     @patch("weread2notion.cli.build_book_properties", return_value={"BookId": {}})
