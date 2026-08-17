@@ -215,20 +215,20 @@ class SafeSyncTests(unittest.TestCase):
         self.assertEqual(properties["封面"]["files"][0]["external"]["url"], "https://example.com/cover.jpg")
         self.assertEqual(properties["阅读状态"], {"status": {"name": "在读"}})
 
-    @patch("weread2notion.cli.append_template_relations")
     @patch("weread2notion.cli.upsert_template_page")
-    def test_template_periods_use_chinese_calendar_titles(self, upsert, append):
+    @patch("weread2notion.cli.get_or_create_template_page")
+    def test_template_periods_use_chinese_calendar_titles(self, get_or_create, upsert):
         self.configure_template_sources()
-        upsert.side_effect = [("day", True), ("week", True), ("month", True), ("year", True)]
+        get_or_create.side_effect = [("week", True), ("month", True), ("year", True)]
+        upsert.return_value = ("day", True)
 
         periods = cli.ensure_template_periods(1786939200)
 
         self.assertEqual(periods, {"日": "day", "周": "week", "月": "month", "年": "year"})
-        self.assertEqual(upsert.call_args_list[0].args[2], "2026年08月17日")
-        self.assertEqual(upsert.call_args_list[1].args[2], "2026年第34周")
-        self.assertEqual(upsert.call_args_list[2].args[2], "2026年8月")
-        self.assertEqual(upsert.call_args_list[3].args[2], "2026")
-        self.assertEqual(append.call_count, 6)
+        self.assertEqual(get_or_create.call_args_list[0].args[2], "2026年第34周")
+        self.assertEqual(get_or_create.call_args_list[1].args[2], "2026年8月")
+        self.assertEqual(get_or_create.call_args_list[2].args[2], "2026")
+        self.assertEqual(upsert.call_args.args[2], "2026年08月17日")
 
     def test_template_daily_stats_normalize_timestamp_and_duration(self):
         entries = cli.get_reading_day_entries(

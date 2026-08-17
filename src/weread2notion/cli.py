@@ -1464,6 +1464,15 @@ def upsert_template_page(source_name, lookup_property, lookup_value, raw_propert
     return page_id, True
 
 
+def get_or_create_template_page(source_name, lookup_property, lookup_value, raw_properties):
+    existing = find_template_page(source_name, lookup_property, lookup_value)
+    if existing:
+        return existing["id"], False
+    return upsert_template_page(
+        source_name, lookup_property, lookup_value, raw_properties
+    )
+
+
 def append_template_relations(source_name, page_id, property_name, related_ids):
     if not related_ids or template_property_type(source_name, property_name) != "relation":
         return
@@ -1516,7 +1525,7 @@ def period_names(target_date):
     }
 
 
-def ensure_template_periods(value):
+def ensure_template_periods(value, daily_seconds=None, daily_timestamp=None):
     target_date = normalize_template_target_date(value)
     if not target_date:
         return {}
@@ -1525,8 +1534,9 @@ def ensure_template_periods(value):
         return template_period_cache[cache_key]
     names = period_names(target_date)
     pages = {}
-    for source_name, (title, start_date) in names.items():
-        page_id, _ = upsert_template_page(
+    for source_name in ("周", "月", "年"):
+        title, start_date = names[source_name]
+        page_id, _ = get_or_create_template_page(
             source_name,
             template_source(source_name)["title_name"],
             title,
@@ -1536,12 +1546,25 @@ def ensure_template_periods(value):
             },
         )
         pages[source_name] = page_id
-    append_template_relations("日", pages["日"], "周", [pages["周"]])
-    append_template_relations("日", pages["日"], "月", [pages["月"]])
-    append_template_relations("日", pages["日"], "年", [pages["年"]])
-    append_template_relations("周", pages["周"], "每日阅读统计", [pages["日"]])
-    append_template_relations("月", pages["月"], "每日阅读统计", [pages["日"]])
-    append_template_relations("年", pages["年"], "每日阅读统计", [pages["日"]])
+    day_title, day_date = names["日"]
+    day_properties = {
+        template_source("日")["title_name"]: day_title,
+        "日期": day_date.isoformat(),
+        "周": [pages["周"]],
+        "月": [pages["月"]],
+        "年": [pages["年"]],
+    }
+    if daily_seconds is not None:
+        day_properties["时长"] = daily_seconds
+    if daily_timestamp is not None:
+        day_properties["时间戳"] = daily_timestamp
+    page_id, _ = upsert_template_page(
+        "日",
+        template_source("日")["title_name"],
+        day_title,
+        day_properties,
+    )
+    pages["日"] = page_id
     template_period_cache[cache_key] = pages
     return pages
 
@@ -1564,27 +1587,16 @@ def get_reading_day_entries(reading_stats):
 def sync_template_daily_stats():
     reading_stats = get_reading_stats("annually")
     entries = get_reading_day_entries(reading_stats)
-    for date_text, entry in entries.items():
-        target_date = datetime.fromisoformat(date_text).date()
-        periods = ensure_template_periods(target_date)
-        upsert_template_page(
-            "日",
-            template_source("日")["title_name"],
-            period_names(target_date)["日"][0],
-            {
-                template_source("日")["title_name"]: period_names(target_date)["日"][0],
-                "日期": date_text,
-                "时长": entry["seconds"],
-                "时间戳": entry["timestamp"],
-            },
+    for entry in entries.values():
+        ensure_template_periods(
+            entry["timestamp"],
+            daily_seconds=entry["seconds"],
+            daily_timestamp=entry["timestamp"],
         )
-        append_template_relations("日", periods["日"], "周", [periods["周"]])
-        append_template_relations("日", periods["日"], "月", [periods["月"]])
-        append_template_relations("日", periods["日"], "年", [periods["年"]])
     return len(entries)
 
 
-def template_book_properties(entry, sort, read_info=None):
+def template_book_properties(entry, sort, read_info=None, periods=None):
     author_page = ensure_named_template_page("作者", entry.get("author"))
     category_pages = [
         page_id
@@ -1617,6 +1629,15 @@ def template_book_properties(entry, sort, read_info=None):
         raw["ISBN"] = entry["isbn"]
     if entry.get("rating") is not None:
         raw["评分"] = entry["rating"]
+    if periods:
+        raw.update(
+            {
+                "日": [periods["日"]],
+                "周": [periods["周"]],
+                "月": [periods["月"]],
+                "年": [periods["年"]],
+            }
+        )
     return raw
 
 
@@ -1773,19 +1794,14 @@ def sync_template_workspace(template_page_id):
             or "评分" in template_source("书架")["property_types"]
         ) and (existing is None or sort > latest_sort):
             entry["isbn"], entry["rating"] = get_bookinfo(book_id)
+        periods = ensure_template_periods(entry.get("read_update_time"))
         book_page_id, created = upsert_template_page(
             "书架",
             "BookId",
             book_id,
-            template_book_properties(entry, sort, read_info),
+            template_book_properties(entry, sort, read_info, periods),
         )
         counts["books"] += 1
-        periods = ensure_template_periods(entry.get("read_update_time"))
-        if periods:
-            for relation_name in ("日", "周", "月", "年"):
-                append_template_relations(
-                    "书架", book_page_id, relation_name, [periods[relation_name]]
-                )
         should_sync_details = bool(notebook and (created or sort > latest_sort))
         if should_sync_details and entry.get("kind") == "电子书":
             highlights, notes, chapters = sync_template_annotations(book_id, book_page_id)
