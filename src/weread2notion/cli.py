@@ -5,7 +5,7 @@ import re
 import time
 from notion_client import Client
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import hashlib
 from dotenv import load_dotenv
@@ -14,6 +14,7 @@ from retrying import retry
 from .blocks import (
     get_callout,
     get_date,
+    get_file,
     get_heading,
     get_icon,
     get_multi_select,
@@ -33,6 +34,10 @@ data_source_property_types = {}
 title_property_name = None
 skipped_property_names = set()
 weread = None
+template_sources = {}
+template_relation_cache = {}
+template_lookup_cache = {}
+template_period_cache = {}
 
 load_dotenv()
 WEREAD_URL = "https://weread.qq.com/"
@@ -48,6 +53,31 @@ SYNC_BLOCK_MARKER = "\u2063\u2064\u2062"
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 READING_DASHBOARD_TITLE = "阅读看板"
 READING_DAILY_ROOT_TITLE = "阅读日报"
+TEMPLATE_SOURCE_NAMES = (
+    "书架",
+    "笔记",
+    "划线",
+    "章节",
+    "阅读记录",
+    "日",
+    "周",
+    "月",
+    "年",
+    "分类",
+    "作者",
+)
+TEMPLATE_REQUIRED_SOURCE_NAMES = {
+    "书架",
+    "笔记",
+    "划线",
+    "章节",
+    "日",
+    "周",
+    "月",
+    "年",
+    "分类",
+    "作者",
+}
 NOTION_TOKEN_PATTERN = re.compile(r"^(secret|ntn)_[A-Za-z0-9_-]{20,}$")
 WEREAD_API_KEY_PATTERN = re.compile(r"^[A-Za-z0-9._~+/=-]{10,}$")
 NOTION_ID_PATTERN = re.compile(
@@ -1211,6 +1241,564 @@ def get_number_property_value(property_value):
     return 0
 
 
+def get_child_database_title(block):
+    return (block.get("child_database") or {}).get("title") or ""
+
+
+def list_descendant_blocks(block_id, max_depth=5, _depth=0):
+    blocks = list_block_children(block_id)
+    if _depth >= max_depth:
+        return blocks
+    results = list(blocks)
+    for block in blocks:
+        if block.get("has_children"):
+            results.extend(
+                list_descendant_blocks(block.get("id"), max_depth, _depth + 1)
+            )
+    return results
+
+
+def resolve_template_source_id(database_id):
+    """Resolve a child database/block ID to its first data source."""
+    try:
+        client.request(path=f"data_sources/{database_id}", method="GET")
+        return database_id
+    except APIResponseError as error:
+        code = getattr(error.code, "value", error.code)
+        if code not in {"object_not_found", "validation_error"}:
+            raise
+    database = client.request(path=f"databases/{database_id}", method="GET")
+    sources = database.get("data_sources") or []
+    if not sources:
+        raise Exception(f"Notion 数据库 {database_id} 没有可用的 data source")
+    return sources[0]["id"]
+
+
+def load_template_source(database_id, display_name):
+    source_id = resolve_template_source_id(database_id)
+    response = client.request(path=f"data_sources/{source_id}", method="GET")
+    properties = response.get("properties") or {}
+    property_types = {
+        name: (config or {}).get("type") for name, config in properties.items()
+    }
+    title_name = next(
+        (name for name, prop_type in property_types.items() if prop_type == "title"),
+        None,
+    )
+    if not title_name:
+        raise Exception(f"Notion 数据源 {display_name} 缺少 Title 属性")
+    return {
+        "name": display_name,
+        "database_id": database_id,
+        "data_source_id": source_id,
+        "property_types": property_types,
+        "title_name": title_name,
+    }
+
+
+def discover_template_sources(template_page_id):
+    """Discover the databases embedded in the official reading-center page."""
+    discovered = {}
+    for block in list_descendant_blocks(template_page_id):
+        if block.get("type") != "child_database":
+            continue
+        title = get_child_database_title(block)
+        if title not in TEMPLATE_SOURCE_NAMES or title in discovered:
+            continue
+        discovered[title] = load_template_source(block["id"], title)
+    if not discovered:
+        return {}
+    missing = sorted(TEMPLATE_REQUIRED_SOURCE_NAMES - set(discovered))
+    if missing:
+        raise Exception(
+            "正式微信读书模板缺少这些数据库："
+            + ", ".join(missing)
+            + "。请确认 NOTION_PAGE 指向模板总页面，并已授权 weread2notion。"
+        )
+    return discovered
+
+
+def template_source(name):
+    source = template_sources.get(name)
+    if not source:
+        raise Exception(f"正式模板中没有找到“{name}”数据库")
+    return source
+
+
+def template_property_type(source_name, property_name):
+    return template_source(source_name)["property_types"].get(property_name)
+
+
+def build_template_filter(source_name, property_name, value):
+    prop_type = template_property_type(source_name, property_name)
+    if prop_type in {"title", "rich_text", "url", "email", "phone_number"}:
+        return {"property": property_name, prop_type: {"equals": str(value)}}
+    if prop_type == "number":
+        return {"property": property_name, "number": {"equals": to_number(value)}}
+    if prop_type == "select":
+        return {"property": property_name, "select": {"equals": str(value)}}
+    if prop_type == "status":
+        return {"property": property_name, "status": {"equals": str(value)}}
+    raise Exception(
+        f"正式模板的“{source_name}”数据库属性 {property_name} 类型 {prop_type} 不支持查询"
+    )
+
+
+def query_template_source(source_name, **body):
+    source_id = template_source(source_name)["data_source_id"]
+    return client.request(
+        path=f"data_sources/{source_id}/query", method="POST", body=body
+    )
+
+
+def find_template_page(source_name, property_name, value):
+    key = (source_name, property_name, str(value))
+    if key in template_lookup_cache:
+        return template_lookup_cache[key]
+    response = query_template_source(
+        source_name, filter=build_template_filter(source_name, property_name, value), page_size=1
+    )
+    result = (response.get("results") or [None])[0]
+    template_lookup_cache[key] = result
+    return result
+
+
+def normalize_timestamp(value):
+    number = to_number(value)
+    if number is None or number <= 0:
+        return None
+    if number > 100000000000:
+        number /= 1000
+    try:
+        return datetime.fromtimestamp(number, SHANGHAI_TZ)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def normalize_template_date(value):
+    if isinstance(value, (int, float)):
+        date_value = normalize_timestamp(value)
+        return date_value.isoformat(timespec="seconds") if date_value else None
+    return value
+
+
+def normalize_template_target_date(value):
+    if hasattr(value, "year") and not hasattr(value, "hour"):
+        return value
+    if hasattr(value, "date"):
+        return value.date()
+    if isinstance(value, str):
+        timestamp = normalize_timestamp(value)
+        if timestamp:
+            return timestamp.date()
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo:
+                parsed = parsed.astimezone(SHANGHAI_TZ)
+            return parsed.date()
+        except ValueError:
+            return None
+    timestamp = normalize_timestamp(value)
+    return timestamp.date() if timestamp else None
+
+
+def build_template_property(source_name, property_name, value):
+    prop_type = template_property_type(source_name, property_name)
+    if not prop_type or value is None:
+        return None
+    if prop_type == "title":
+        return get_title(to_text(value))
+    if prop_type in {"rich_text", "text"}:
+        return get_rich_text(to_text(value))
+    if prop_type == "number":
+        number = to_number(value)
+        return get_number(number) if number is not None else None
+    if prop_type == "url":
+        return get_url(to_text(value))
+    if prop_type in {"select", "status"}:
+        names = to_name_list(value)
+        if not names:
+            return None
+        return get_status(names[0]) if prop_type == "status" else get_select(names[0])
+    if prop_type == "multi_select":
+        names = to_name_list(value)
+        return get_multi_select(names) if names else None
+    if prop_type == "date":
+        value = normalize_template_date(value)
+        return get_date(value) if value else None
+    if prop_type == "checkbox":
+        return {"checkbox": bool(value)}
+    if prop_type == "relation":
+        ids = to_name_list(value)
+        return {"relation": [{"id": item} for item in ids]} if ids else None
+    if prop_type in {"files", "file"}:
+        url = value[0] if isinstance(value, (list, tuple)) and value else value
+        return get_file(url) if url else None
+    return None
+
+
+def build_template_properties(source_name, raw_properties):
+    properties = {}
+    for name, value in raw_properties.items():
+        if name not in template_source(source_name)["property_types"]:
+            continue
+        prop = build_template_property(source_name, name, value)
+        if prop is not None:
+            properties[name] = prop
+    return properties
+
+
+def upsert_template_page(source_name, lookup_property, lookup_value, raw_properties):
+    existing = find_template_page(source_name, lookup_property, lookup_value)
+    properties = build_template_properties(source_name, raw_properties)
+    if existing:
+        if properties:
+            client.pages.update(page_id=existing["id"], properties=properties)
+        return existing["id"], False
+    response = client.pages.create(
+        parent={"type": "data_source_id", "data_source_id": template_source(source_name)["data_source_id"]},
+        properties=properties,
+    )
+    page_id = response["id"]
+    template_lookup_cache[(source_name, lookup_property, str(lookup_value))] = response
+    return page_id, True
+
+
+def append_template_relations(source_name, page_id, property_name, related_ids):
+    if not related_ids or template_property_type(source_name, property_name) != "relation":
+        return
+    related_ids = {str(item) for item in related_ids if item}
+    cache_key = (source_name, page_id, property_name)
+    if cache_key not in template_relation_cache:
+        page = client.pages.retrieve(page_id=page_id)
+        current = ((page.get("properties") or {}).get(property_name) or {}).get("relation") or []
+        template_relation_cache[cache_key] = {item.get("id") for item in current if item.get("id")}
+    merged = template_relation_cache[cache_key] | related_ids
+    if merged == template_relation_cache[cache_key]:
+        return
+    template_relation_cache[cache_key] = merged
+    client.pages.update(
+        page_id=page_id,
+        properties={property_name: {"relation": [{"id": item} for item in sorted(merged)]}},
+    )
+
+
+def ensure_named_template_page(source_name, title):
+    title = to_text(title).strip()
+    if not title:
+        return None
+    cache_key = ("reference", source_name, title)
+    if cache_key in template_lookup_cache:
+        return template_lookup_cache[cache_key]
+    existing = find_template_page(
+        source_name, template_source(source_name)["title_name"], title
+    )
+    if existing:
+        template_lookup_cache[cache_key] = existing["id"]
+        return existing["id"]
+    page_id, _ = upsert_template_page(
+        source_name,
+        template_source(source_name)["title_name"],
+        title,
+        {template_source(source_name)["title_name"]: title},
+    )
+    template_lookup_cache[cache_key] = page_id
+    return page_id
+
+
+def period_names(target_date):
+    iso = target_date.isocalendar()
+    return {
+        "日": (target_date.strftime("%Y年%m月%d日"), target_date),
+        "周": (f"{iso.year}年第{iso.week}周", target_date - timedelta(days=target_date.weekday())),
+        "月": (f"{target_date.year}年{target_date.month}月", target_date.replace(day=1)),
+        "年": (str(target_date.year), target_date.replace(month=1, day=1)),
+    }
+
+
+def ensure_template_periods(value):
+    target_date = normalize_template_target_date(value)
+    if not target_date:
+        return {}
+    cache_key = target_date.isoformat()
+    if cache_key in template_period_cache:
+        return template_period_cache[cache_key]
+    names = period_names(target_date)
+    pages = {}
+    for source_name, (title, start_date) in names.items():
+        page_id, _ = upsert_template_page(
+            source_name,
+            template_source(source_name)["title_name"],
+            title,
+            {
+                template_source(source_name)["title_name"]: title,
+                "日期": start_date.isoformat(),
+            },
+        )
+        pages[source_name] = page_id
+    append_template_relations("日", pages["日"], "周", [pages["周"]])
+    append_template_relations("日", pages["日"], "月", [pages["月"]])
+    append_template_relations("日", pages["日"], "年", [pages["年"]])
+    append_template_relations("周", pages["周"], "每日阅读统计", [pages["日"]])
+    append_template_relations("月", pages["月"], "每日阅读统计", [pages["日"]])
+    append_template_relations("年", pages["年"], "每日阅读统计", [pages["日"]])
+    template_period_cache[cache_key] = pages
+    return pages
+
+
+def get_reading_day_entries(reading_stats):
+    entries = {}
+    for field in ("dailyReadTimes", "readTimes"):
+        for timestamp, seconds in (reading_stats.get(field) or {}).items():
+            target_date = normalize_template_target_date(timestamp)
+            if not target_date:
+                continue
+            key = target_date.isoformat()
+            entries[key] = {
+                "timestamp": to_number(timestamp) or 0,
+                "seconds": int(to_number(seconds) or 0),
+            }
+    return entries
+
+
+def sync_template_daily_stats():
+    reading_stats = get_reading_stats("annually")
+    entries = get_reading_day_entries(reading_stats)
+    for date_text, entry in entries.items():
+        target_date = datetime.fromisoformat(date_text).date()
+        periods = ensure_template_periods(target_date)
+        upsert_template_page(
+            "日",
+            template_source("日")["title_name"],
+            period_names(target_date)["日"][0],
+            {
+                template_source("日")["title_name"]: period_names(target_date)["日"][0],
+                "日期": date_text,
+                "时长": entry["seconds"],
+                "时间戳": entry["timestamp"],
+            },
+        )
+        append_template_relations("日", periods["日"], "周", [periods["周"]])
+        append_template_relations("日", periods["日"], "月", [periods["月"]])
+        append_template_relations("日", periods["日"], "年", [periods["年"]])
+    return len(entries)
+
+
+def template_book_properties(entry, sort, read_info=None):
+    author_page = ensure_named_template_page("作者", entry.get("author"))
+    category_pages = [
+        page_id
+        for category in (entry.get("categories") or [])
+        if (page_id := ensure_named_template_page("分类", category))
+    ]
+    finished = bool(entry.get("finished"))
+    read_update_time = entry.get("read_update_time") or 0
+    status = "已读" if finished else ("在读" if read_update_time else "想读")
+    raw = {
+        "书名": entry.get("title") or "未命名书籍",
+        "BookId": entry.get("book_id"),
+        "Sort": sort,
+        "作者": [author_page] if author_page else None,
+        "分类": category_pages,
+        "链接": entry.get("link"),
+        "封面": entry.get("cover"),
+        "阅读状态": status,
+        "最后阅读时间": read_update_time,
+    }
+    if read_info:
+        status = read_info.get("markedStatus")
+        raw["阅读状态"] = "已读" if status == 4 else ("在读" if status == 2 else "想读")
+        raw["阅读时长"] = read_info.get("readingTime") or 0
+        raw["阅读进度"] = read_info.get("readingProgress") or 0
+        if read_info.get("finishedDate"):
+            raw["时间"] = read_info["finishedDate"]
+            raw["最后阅读时间"] = read_info["finishedDate"]
+    if entry.get("isbn"):
+        raw["ISBN"] = entry["isbn"]
+    if entry.get("rating") is not None:
+        raw["评分"] = entry["rating"]
+    return raw
+
+
+def build_template_entry_from_notebook(item):
+    book = item.get("book") or item
+    book_id = book.get("bookId")
+    return {
+        "book_id": str(book_id),
+        "title": book.get("title") or "未命名书籍",
+        "author": book.get("author") or "",
+        "cover": (book.get("cover") or "").replace("/s_", "/t7_"),
+        "link": book.get("deepLink") or f"https://weread.qq.com/web/reader/{calculate_book_str_id(book_id)}",
+        "categories": normalize_categories(book.get("categories")),
+        "kind": "电子书",
+        "finished": False,
+        "read_update_time": book.get("readUpdateTime") or 0,
+    }
+
+
+def sync_template_chapters(book_id, book_page_id, chapter):
+    if not chapter:
+        return
+    for chapter_uid, item in chapter.items():
+        chapter_uid = to_number(chapter_uid)
+        if chapter_uid is None:
+            continue
+        block_id = f"{book_id}:{chapter_uid}"
+        raw = {
+            "Name": item.get("title") or item.get("chapterTitle") or f"章节 {chapter_uid}",
+            "blockId": block_id,
+            "chapterIdx": item.get("chapterIdx"),
+            "chapterUid": chapter_uid,
+            "level": item.get("level"),
+            "readAhead": item.get("readAhead"),
+            "tar": item.get("tar"),
+            "updateTime": item.get("updateTime"),
+            "书籍": [book_page_id],
+        }
+        upsert_template_page("章节", "blockId", block_id, raw)
+
+
+def sync_template_annotations(book_id, book_page_id):
+    chapter = get_chapter_info(book_id)
+    bookmark_list = get_bookmark_list(book_id)
+    _, reviews = get_review_list(book_id)
+    period_cache = {}
+    for bookmark in bookmark_list:
+        bookmark_id = bookmark.get("bookmarkId") or hashlib.md5(
+            f"{book_id}:{bookmark.get('chapterUid')}:{bookmark.get('range')}:{bookmark.get('markText')}".encode("utf-8")
+        ).hexdigest()
+        date_value = bookmark.get("createTime") or bookmark.get("date")
+        period_key = str(date_value)
+        if period_key not in period_cache:
+            period_cache[period_key] = ensure_template_periods(date_value)
+        periods = period_cache[period_key]
+        raw = {
+            "Name": bookmark.get("markText") or "微信读书划线",
+            "Date": date_value,
+            "blockId": bookmark.get("blockId"),
+            "bookId": str(book_id),
+            "bookVersion": bookmark.get("bookVersion"),
+            "bookmarkId": bookmark_id,
+            "chapterUid": bookmark.get("chapterUid"),
+            "colorStyle": bookmark.get("colorStyle"),
+            "range": bookmark.get("range"),
+            "style": bookmark.get("style"),
+            "type": bookmark.get("type"),
+            "书籍": [book_page_id],
+            "日": [periods.get("日")],
+            "周": [periods.get("周")],
+            "月": [periods.get("月")],
+            "年": [periods.get("年")],
+        }
+        upsert_template_page("划线", "bookmarkId", bookmark_id, raw)
+    for review in reviews:
+        review_id = review.get("reviewId") or hashlib.md5(
+            f"{book_id}:{review.get('createTime')}:{review.get('markText')}".encode("utf-8")
+        ).hexdigest()
+        date_value = review.get("createTime") or review.get("date")
+        period_key = str(date_value)
+        if period_key not in period_cache:
+            period_cache[period_key] = ensure_template_periods(date_value)
+        periods = period_cache[period_key]
+        raw = {
+            "Name": review.get("markText") or review.get("content") or "微信读书想法",
+            "Date": date_value,
+            "abstract": review.get("abstract"),
+            "blockId": review.get("blockId"),
+            "bookId": str(book_id),
+            "bookVersion": review.get("bookVersion"),
+            "chapterUid": review.get("chapterUid"),
+            "range": review.get("range"),
+            "reviewId": review_id,
+            "star": review.get("star"),
+            "style": review.get("style"),
+            "type": review.get("type"),
+            "书籍": [book_page_id],
+            "日": [periods.get("日")],
+            "周": [periods.get("周")],
+            "月": [periods.get("月")],
+            "年": [periods.get("年")],
+        }
+        upsert_template_page("笔记", "reviewId", review_id, raw)
+    sync_template_chapters(book_id, book_page_id, chapter)
+    return len(bookmark_list), len(reviews), len(chapter)
+
+
+def sync_template_workspace(template_page_id):
+    global template_sources, template_relation_cache, template_lookup_cache, template_period_cache
+    template_sources = discover_template_sources(template_page_id)
+    template_relation_cache = {}
+    template_lookup_cache = {}
+    template_period_cache = {}
+    day_count = sync_template_daily_stats()
+    notebooks = get_notebooklist()
+    shelf_entries = get_shelf_entries(get_shelf())
+    entry_by_id = {entry["book_id"]: entry for entry in shelf_entries}
+    for notebook in notebooks:
+        entry = build_template_entry_from_notebook(notebook)
+        entry_by_id.setdefault(entry["book_id"], entry)
+    latest_sort = 0
+    if "Sort" in template_source("书架")["property_types"]:
+        response = query_template_source(
+            "书架",
+            sorts=[{"property": "Sort", "direction": "descending"}],
+            page_size=1,
+        )
+        if response.get("results"):
+            latest_sort = get_number_property_value(
+                (response["results"][0].get("properties") or {}).get("Sort")
+            )
+    notebook_by_id = {
+        str(get_notebook_book_id(item)): item
+        for item in notebooks
+        if get_notebook_book_id(item)
+    }
+    counts = {"books": 0, "highlights": 0, "notes": 0, "chapters": 0}
+    for entry in entry_by_id.values():
+        book_id = entry["book_id"]
+        notebook = notebook_by_id.get(book_id)
+        sort = (notebook or {}).get("sort") or 0
+        read_info = None
+        if entry.get("kind") == "电子书" and (
+            entry.get("read_update_time") or entry.get("finished") or notebook
+        ):
+            read_info = get_read_info(book_id)
+        if entry.get("kind") != "电子书":
+            read_info = None
+        if read_info and read_info.get("finishedDate"):
+            entry["read_update_time"] = read_info["finishedDate"]
+        existing = find_template_page("书架", "BookId", book_id)
+        if entry.get("kind") == "电子书" and (
+            "ISBN" in template_source("书架")["property_types"]
+            or "评分" in template_source("书架")["property_types"]
+        ) and (existing is None or sort > latest_sort):
+            entry["isbn"], entry["rating"] = get_bookinfo(book_id)
+        book_page_id, created = upsert_template_page(
+            "书架",
+            "BookId",
+            book_id,
+            template_book_properties(entry, sort, read_info),
+        )
+        counts["books"] += 1
+        periods = ensure_template_periods(entry.get("read_update_time"))
+        if periods:
+            for relation_name in ("日", "周", "月", "年"):
+                append_template_relations(
+                    "书架", book_page_id, relation_name, [periods[relation_name]]
+                )
+        should_sync_details = bool(notebook and (created or sort > latest_sort))
+        if should_sync_details and entry.get("kind") == "电子书":
+            highlights, notes, chapters = sync_template_annotations(book_id, book_page_id)
+            counts["highlights"] += highlights
+            counts["notes"] += notes
+            counts["chapters"] += chapters
+    print(
+        "正式模板同步完成："
+        f"日统计 {day_count}，书籍 {counts['books']}，划线 {counts['highlights']}，"
+        f"笔记 {counts['notes']}，章节 {counts['chapters']}"
+    )
+
+
 def resolve_data_source_id(notion_id):
     if os.getenv("NOTION_DATA_SOURCE_ID"):
         return notion_id
@@ -1341,6 +1929,17 @@ def sync():
         log_level=logging.ERROR,
         notion_version=NOTION_VERSION,
     )
+    try:
+        discovered_template = discover_template_sources(notion_id)
+    except APIResponseError as error:
+        code = getattr(error.code, "value", error.code)
+        if code not in {"object_not_found", "validation_error"}:
+            raise
+        discovered_template = {}
+    if discovered_template:
+        print(f"已识别正式微信读书模板：{len(discovered_template)} 个数据库")
+        sync_template_workspace(notion_id)
+        return
     data_source_id = resolve_data_source_id(notion_id)
     print(f"Notion API Version: {NOTION_VERSION}")
     print(f"Notion Data Source ID: {data_source_id}")
