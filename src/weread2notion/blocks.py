@@ -1,3 +1,6 @@
+import re
+
+
 def get_rich_text_segments(content, marker=None):
     segments = [
         {
@@ -80,7 +83,9 @@ def get_multi_select(names):
 
 def get_date(start):
     date = {"start": start}
-    if "T" in str(start):
+    value = str(start)
+    has_utc_offset = value.endswith("Z") or bool(re.search(r"[+-]\d{2}:\d{2}$", value))
+    if "T" in value and not has_utc_offset:
         date["time_zone"] = "Asia/Shanghai"
     return {"date": date}
 
