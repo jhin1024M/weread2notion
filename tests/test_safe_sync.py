@@ -15,7 +15,7 @@ class SafeSyncTests(unittest.TestCase):
     def restore_client(self):
         cli.client = self.previous_client
 
-    def test_find_sync_page_returns_managed_child_page(self):
+    def test_find_sync_container_returns_inline_toggle(self):
         self.client.blocks.children.list.return_value = {
             "results": [
                 {
@@ -25,26 +25,54 @@ class SafeSyncTests(unittest.TestCase):
                 },
                 {
                     "id": "managed-content",
-                    "type": "child_page",
-                    "child_page": {"title": cli.SYNC_PAGE_TITLE},
+                    "type": "toggle",
+                    "toggle": {
+                        "rich_text": [{"plain_text": cli.SYNC_PAGE_TITLE}]
+                    },
                 },
             ],
             "has_more": False,
         }
 
-        self.assertEqual(cli.find_sync_page("book-page"), "managed-content")
+        self.assertEqual(cli.find_sync_container("book-page"), "managed-content")
 
-    def test_clear_sync_page_only_archives_its_direct_children(self):
+    def test_clear_sync_container_only_archives_its_direct_children(self):
         self.client.blocks.children.list.return_value = {
             "results": [{"id": "block-1"}, {"id": "block-2"}],
             "has_more": False,
         }
 
-        cli.clear_sync_page("managed-content")
+        cli.clear_sync_container("managed-content")
 
         self.client.blocks.delete.assert_any_call(block_id="block-1")
         self.client.blocks.delete.assert_any_call(block_id="block-2")
         self.assertEqual(self.client.blocks.delete.call_count, 2)
+
+    def test_create_sync_container_adds_inline_toggle(self):
+        self.client.blocks.children.append.return_value = {
+            "results": [{"id": "managed-content"}]
+        }
+
+        container_id = cli.create_sync_container("book-page")
+
+        self.assertEqual(container_id, "managed-content")
+        self.client.blocks.children.append.assert_called_once_with(
+            block_id="book-page",
+            children=[
+                {
+                    "type": "toggle",
+                    "toggle": {
+                        "rich_text": [
+                            {
+                                "type": "text",
+                                "text": {"content": cli.SYNC_PAGE_TITLE},
+                            }
+                        ],
+                        "color": "default",
+                    },
+                }
+            ],
+        )
 
     @patch("weread2notion.cli.get_icon", return_value={"type": "external"})
     @patch("weread2notion.cli.build_book_properties", return_value={"BookId": {}})
