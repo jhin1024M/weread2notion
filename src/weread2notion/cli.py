@@ -1598,6 +1598,11 @@ def sync_template_daily_stats():
     return len(entries)
 
 
+def template_details_need_bootstrap():
+    response = query_template_source("章节", page_size=1)
+    return not bool(response.get("results"))
+
+
 def template_book_properties(entry, sort, read_info=None, periods=None):
     author_page = ensure_named_template_page("作者", entry.get("author"))
     category_pages = [
@@ -1776,6 +1781,7 @@ def sync_template_workspace(template_page_id):
         for item in notebooks
         if get_notebook_book_id(item)
     }
+    details_need_bootstrap = template_details_need_bootstrap()
     counts = {"books": 0, "highlights": 0, "notes": 0, "chapters": 0}
     for entry in entry_by_id.values():
         book_id = entry["book_id"]
@@ -1804,7 +1810,10 @@ def sync_template_workspace(template_page_id):
             template_book_properties(entry, sort, read_info, periods),
         )
         counts["books"] += 1
-        should_sync_details = bool(notebook and (created or sort > latest_sort))
+        should_sync_details = bool(
+            notebook
+            and (created or sort > latest_sort or details_need_bootstrap)
+        )
         if should_sync_details and entry.get("kind") == "电子书":
             highlights, notes, chapters = sync_template_annotations(book_id, book_page_id)
             counts["highlights"] += highlights
