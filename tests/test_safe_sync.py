@@ -27,7 +27,7 @@ class SafeSyncTests(unittest.TestCase):
     def configure_template_sources(self):
         sources = {}
         for name, title_name, property_types in (
-            ("书架", "书名", {"书名": "title", "BookId": "rich_text", "作者": "relation", "分类": "relation", "封面": "files", "阅读状态": "status", "阅读进度": "number", "阅读时长": "number", "最后阅读时间": "date", "日": "relation", "周": "relation", "月": "relation", "年": "relation"}),
+            ("书架", "书名", {"书名": "title", "BookId": "rich_text", "作者": "relation", "分类": "relation", "链接": "url", "封面": "files", "阅读状态": "status", "阅读进度": "number", "阅读时长": "number", "最后阅读时间": "date", "日": "relation", "周": "relation", "月": "relation", "年": "relation"}),
             ("作者", "标题", {"标题": "title"}),
             ("分类", "标题", {"标题": "title"}),
             ("日", "标题", {"标题": "title", "日期": "date", "周": "relation", "月": "relation", "年": "relation"}),
@@ -214,6 +214,13 @@ class SafeSyncTests(unittest.TestCase):
         self.assertEqual(properties["分类"], {"relation": [{"id": "category-page"}]})
         self.assertEqual(properties["封面"]["files"][0]["external"]["url"], "https://example.com/cover.jpg")
         self.assertEqual(properties["阅读状态"], {"status": {"name": "在读"}})
+
+    def test_template_properties_skip_empty_url_values(self):
+        self.configure_template_sources()
+
+        properties = cli.build_template_properties("书架", {"链接": ""})
+
+        self.assertNotIn("链接", properties)
 
     @patch("weread2notion.cli.upsert_template_page")
     @patch("weread2notion.cli.get_or_create_template_page")
