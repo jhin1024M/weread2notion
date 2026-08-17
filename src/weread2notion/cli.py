@@ -43,6 +43,7 @@ NOTE_CALLOUT_ICON = "✍️"
 SYNC_PAGE_TITLE = "微信读书同步内容"
 SYNC_MODE_SAFE = "safe"
 SYNC_MODE_REPLACE = "replace"
+SYNC_BLOCK_MARKER = "\u2063\u2064\u2062"
 NOTION_TOKEN_PATTERN = re.compile(r"^(secret|ntn)_[A-Za-z0-9_-]{20,}$")
 WEREAD_API_KEY_PATTERN = re.compile(r"^[A-Za-z0-9._~+/=-]{10,}$")
 NOTION_ID_PATTERN = re.compile(
@@ -322,6 +323,10 @@ def get_block_text(block):
     )
 
 
+def is_generated_sync_block(block):
+    return SYNC_BLOCK_MARKER in get_block_text(block)
+
+
 def find_legacy_sync_page(book_page_id):
     """Find the child page created by the first safe-sync implementation."""
     for block in list_block_children(book_page_id):
@@ -354,8 +359,10 @@ def create_sync_container(book_page_id):
 
 
 def clear_sync_container(sync_container_id):
-    """Archive only blocks inside the managed inline toggle block."""
+    """Archive generated blocks while preserving user-authored blocks."""
     for block in list_block_children(sync_container_id):
+        if not is_generated_sync_block(block):
+            continue
         block_id = block.get("id")
         if not block_id:
             continue
@@ -589,7 +596,9 @@ def get_children(chapter, summary, bookmark_list):
                 for chapter_node in path[divergence_index:]:
                     children.append(
                         get_heading(
-                            chapter_node.get("level"), chapter_node.get("title")
+                            chapter_node.get("level"),
+                            chapter_node.get("title"),
+                            marker=SYNC_BLOCK_MARKER,
                         )
                     )
                 previous_path_uids = [node.get("chapterUid") for node in path]
@@ -606,10 +615,11 @@ def get_children(chapter, summary, bookmark_list):
                         get_callout(
                             markText[j * 2000 : (j + 1) * 2000],
                             icon=callout_icon,
+                            marker=SYNC_BLOCK_MARKER,
                         )
                     )
                 if i.get("abstract") != None and i.get("abstract") != "":
-                    quote = get_quote(i.get("abstract"))
+                    quote = get_quote(i.get("abstract"), marker=SYNC_BLOCK_MARKER)
                     grandchild[len(children) - 1] = quote
 
     else:
@@ -623,10 +633,11 @@ def get_children(chapter, summary, bookmark_list):
                     get_callout(
                         markText[i * 2000 : (i + 1) * 2000],
                         icon=BOOKMARK_CALLOUT_ICON,
+                        marker=SYNC_BLOCK_MARKER,
                     )
                 )
     if summary != None and len(summary) > 0:
-        children.append(get_heading(1, "点评"))
+        children.append(get_heading(1, "点评", marker=SYNC_BLOCK_MARKER))
         for i in summary:
             content = (i.get("review") or {}).get("content") or ""
             if not content:
@@ -636,6 +647,7 @@ def get_children(chapter, summary, bookmark_list):
                     get_callout(
                         content[j * 2000 : (j + 1) * 2000],
                         icon=NOTE_CALLOUT_ICON,
+                        marker=SYNC_BLOCK_MARKER,
                     )
                 )
     return children, grandchild
